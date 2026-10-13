@@ -1,13 +1,19 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import subprocess
 import os
 import re
 
 
+def require_local_deployment():
+    if os.getenv("CLOUDGUARD_ENABLE_DEPLOYMENT") != "1":
+        raise HTTPException(403, "Local Docker execution is disabled. Enable only in a trusted, isolated development environment.")
+
+
 router = APIRouter(
     prefix="/deployment",
-    tags=["Deployment"]
+    tags=["Deployment"],
+    dependencies=[Depends(require_local_deployment)]
 )
 
 

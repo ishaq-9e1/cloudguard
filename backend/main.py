@@ -11,6 +11,7 @@ import sys
 import stat
 
 from backend.deployment import router as deployment_router
+from backend.missions import router as missions_router
 
 
 def _force_remove_readonly(func, path, exc_info=None):
@@ -60,6 +61,7 @@ app.add_middleware(
 # ============================================================
 
 app.include_router(deployment_router)
+app.include_router(missions_router)
 
 
 # ============================================================
@@ -646,6 +648,8 @@ def scan_python_dependencies(repo_path):
                     "pip_audit",
                     "-r",
                     requirements_file,
+                    "--disable-pip",
+                    "--no-deps",
                     "--format",
                     "json",
                     "--progress-spinner",
@@ -669,6 +673,7 @@ def scan_python_dependencies(repo_path):
                 continue
 
             if not result.stdout.strip():
+                scan_errors.append({"file": relative_requirements, "error": "Dependency scanner returned no results."})
                 continue
 
             try:
@@ -1342,65 +1347,15 @@ def scan_repository(request: ScanRequest):
             )
         )
 
-    # -------------------------
-    # GET REPOSITORY NAME
-    # -------------------------
-
-    repo_name = (
-        repo_url
-        .rstrip("/")
-        .split("/")[-1]
-    )
-
-    if repo_name.endswith(".git"):
-
-        repo_name = repo_name[:-4]
-
-    # -------------------------
-    # REPOSITORIES DIRECTORY
-    # -------------------------
-
-    repositories_folder = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "repositories"
-        )
-    )
-
-    os.makedirs(
-        repositories_folder,
-        exist_ok=True
-    )
-
-    destination = os.path.join(
-        repositories_folder,
-        repo_name
-    )
-
-    # ========================================================
-    # IMPORTANT FIX
-    # Remove old repository copy if it exists.
-    # ========================================================
-
-    if os.path.exists(destination):
-
-        try:
-
-            try:
-                shutil.rmtree(destination, onexc=_force_remove_readonly)
-            except TypeError:
-                shutil.rmtree(destination, onerror=_force_remove_readonly)
-
-        except Exception as error:
-
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Could not remove previous repository copy: "
-                    + str(error)
-                )
-            )
+    # Isolate concurrent scans and never delete a previous user's checkout.
+    import tempfile
+    from pathlib import Path
+    from backend.missions import collect_files
+    repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
+    repositories_folder = Path(__file__).resolve().parents[1] / "repositories"
+    repositories_folder.mkdir(exist_ok=True)
+    destination = tempfile.mkdtemp(prefix="scan-", dir=repositories_folder)
+    clone_destination = os.path.join(destination, "source")
 
     # ========================================================
     # MAIN SCANNING PIPELINE
@@ -1416,8 +1371,11 @@ def scan_repository(request: ScanRequest):
             [
                 "git",
                 "clone",
+                "--depth",
+                "1",
+                "--",
                 repo_url,
-                destination
+                clone_destination
             ],
             capture_output=True,
             text=True,
@@ -1429,10 +1387,17 @@ def scan_repository(request: ScanRequest):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    result.stderr.strip()
-                    or "Git clone failed."
+                    "Git clone failed. Check the GitHub URL and repository access."
                 )
             )
+
+        files, collection_errors = collect_files(Path(clone_destination))
+        # Analyze bounded regular files, not checkout symlinks or hooks.
+        shutil.rmtree(clone_destination)
+        for name, content in files.items():
+            target = Path(destination) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
 
         # ----------------------------------------------------
         # STEP 2 - DETECT TECHNOLOGY
@@ -1498,8 +1463,8 @@ def scan_repository(request: ScanRequest):
         # ----------------------------------------------------
 
         security_status = (
-            "FAILED"
-            if total_findings > 0
+            "ERROR" if collection_errors or not files or dependency_scan["status"] == "ERROR"
+            else "FAILED" if total_findings > 0
             else "PASSED"
         )
 
@@ -1589,7 +1554,8 @@ def scan_repository(request: ScanRequest):
                 deployment_readiness
             ),
 
-            "saved_to": destination
+            "saved_to": destination,
+            "collection_errors": collection_errors
         }
 
     except subprocess.TimeoutExpired:
